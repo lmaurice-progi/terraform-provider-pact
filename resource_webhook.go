@@ -69,9 +69,25 @@ var requestType = &schema.Schema{
 				Description:  "The HTTP method to use with the request",
 			},
 			"username": {
-				Type:        schema.TypeString,
-				Optional:    true,
-				Description: "An optional (basic auth) username to send with the request",
+				Type:          schema.TypeString,
+				Optional:      true,
+				ConflictsWith: []string{"request.0.username_wo"},
+				Description:   "An optional (basic auth) username to send with the request",
+			},
+			"username_wo": {
+				Type:          schema.TypeString,
+				Optional:      true,
+				Sensitive:     true,
+				WriteOnly:     true,
+				ConflictsWith: []string{"request.0.username"},
+				RequiredWith:  []string{"request.0.username_wo_version"},
+				Description:   "Write-only variant of `username`: sent to the broker but never stored in the Terraform plan or state. Requires Terraform 1.11+. Must be used with `username_wo_version`",
+			},
+			"username_wo_version": {
+				Type:         schema.TypeInt,
+				Optional:     true,
+				RequiredWith: []string{"request.0.username_wo"},
+				Description:  "Version of `username_wo`. Terraform cannot detect changes to write-only values, so change (e.g. increment) this number to push a new `username_wo` to the broker",
 			},
 			"password": {
 				Type:          schema.TypeString,
@@ -100,6 +116,21 @@ var requestType = &schema.Schema{
 				Optional:    true,
 				Elem:        &schema.Schema{Type: schema.TypeString},
 				Description: "Request headers to send with the request",
+			},
+			"headers_wo": {
+				Type:         schema.TypeString,
+				Optional:     true,
+				Sensitive:    true,
+				WriteOnly:    true,
+				RequiredWith: []string{"request.0.headers_wo_version"},
+				ValidateFunc: validateHeadersJSON,
+				Description:  "Write-only request headers, as a JSON object of strings (e.g. `jsonencode({ Authorization = \"Bearer ...\" })`). They are merged with `headers`, sent to the broker but never stored in the Terraform plan or state. Requires Terraform 1.11+. Must be used with `headers_wo_version`",
+			},
+			"headers_wo_version": {
+				Type:         schema.TypeInt,
+				Optional:     true,
+				RequiredWith: []string{"request.0.headers_wo"},
+				Description:  "Version of `headers_wo`. Terraform cannot detect changes to write-only values, so change (e.g. increment) this number to push new `headers_wo` to the broker",
 			},
 			"body": {
 				Type:             schema.TypeString,
@@ -141,6 +172,25 @@ func validateMethod(val interface{}, key string) (warns []string, errs []error) 
 		errs = append(errs, fmt.Errorf("%q must one of the following HTTP Verbs 'GET, PUT, PATCH, POST, DELETE', got: %s", key, v))
 	}
 	return
+}
+
+func validateHeadersJSON(val interface{}, key string) (warns []string, errs []error) {
+	if _, err := parseHeadersJSON(val.(string)); err != nil {
+		errs = append(errs, fmt.Errorf("%q %v", key, err))
+	}
+	return
+}
+
+// parseHeadersJSON parses a JSON object of strings (e.g. the output of jsonencode) into headers.
+func parseHeadersJSON(s string) (map[string]string, error) {
+	headers := map[string]string{}
+	if s == "" {
+		return headers, nil
+	}
+	if err := json.Unmarshal([]byte(s), &headers); err != nil {
+		return nil, fmt.Errorf("must be a JSON object of strings: %v", err)
+	}
+	return headers, nil
 }
 
 func webhook() *schema.Resource {
@@ -246,9 +296,16 @@ func parseWebhook(d *schema.ResourceData, meta interface{}) (broker.Webhook, err
 			request.Method = method.(string)
 		}
 
-		// Username
+		// Username (either the regular attribute or the write-only one)
 		if username, ok := requestMap["username"]; ok {
 			request.Username = username.(string)
+		}
+		if request.Username == "" {
+			username, diags := rawConfigString(d, cty.GetAttrPath("request").IndexInt(0).GetAttr("username_wo"))
+			if diags.HasError() {
+				return *webhook, fmt.Errorf("unable to read request.username_wo: %v", diags[0].Summary)
+			}
+			request.Username = username
 		}
 
 		// Password (either the regular attribute or the write-only one)
@@ -273,7 +330,7 @@ func parseWebhook(d *schema.ResourceData, meta interface{}) (broker.Webhook, err
 			request.Headers = make(map[string]string)
 			if headers, ok := headers.(map[string]interface{}); ok {
 				for k, v := range headers {
-					fmt.Println("[DEBUG] Key", k, "Value", v, "Type", reflect.TypeOf(v))
+					log.Println("[DEBUG] header", k, "type", reflect.TypeOf(v))
 					request.Headers[k] = v.(string)
 				}
 			} else {
@@ -284,6 +341,22 @@ func parseWebhook(d *schema.ResourceData, meta interface{}) (broker.Webhook, err
 		} else {
 			log.Printf("[ERROR] 'headers' is a required field")
 			return *webhook, fmt.Errorf("headers is a mandatory field")
+		}
+
+		// Write-only headers, merged with the regular ones
+		rawHeaders, diags := rawConfigString(d, cty.GetAttrPath("request").IndexInt(0).GetAttr("headers_wo"))
+		if diags.HasError() {
+			return *webhook, fmt.Errorf("unable to read request.headers_wo: %v", diags[0].Summary)
+		}
+		woHeaders, err := parseHeadersJSON(rawHeaders)
+		if err != nil {
+			return *webhook, fmt.Errorf("request.headers_wo %v", err)
+		}
+		for k, v := range woHeaders {
+			if _, exists := request.Headers[k]; exists {
+				return *webhook, fmt.Errorf("header %q is set in both request.headers and request.headers_wo", k)
+			}
+			request.Headers[k] = v
 		}
 
 		// Body
@@ -383,7 +456,15 @@ func flattenRequest(d *schema.ResourceData, r broker.Request) []interface{} {
 	m := make(map[string]interface{})
 	m["url"] = r.URL
 	m["method"] = r.Method
-	m["username"] = r.Username
+
+	// Never persist values that may come from the write-only `username_wo`
+	// attribute: keep whatever `username` value Terraform already has.
+	if version, ok := d.GetOk("request.0.username_wo_version"); ok {
+		m["username_wo_version"] = version.(int)
+		m["username"] = d.Get("request.0.username").(string)
+	} else {
+		m["username"] = r.Username
+	}
 
 	// The broker obscures the password ("*****"), and it may have been provided
 	// via the write-only `password_wo` attribute, which must never be persisted.
@@ -394,7 +475,21 @@ func flattenRequest(d *schema.ResourceData, r broker.Request) []interface{} {
 	if version, ok := d.GetOk("request.0.password_wo_version"); ok {
 		m["password_wo_version"] = version.(int)
 	}
-	m["headers"] = mapStringStringToMapStringInterface(r.Headers) // TODO
+
+	// When write-only headers are in use, only the headers Terraform already
+	// knows about (`headers`) are stored; the others come from `headers_wo`.
+	headers := r.Headers
+	if version, ok := d.GetOk("request.0.headers_wo_version"); ok {
+		m["headers_wo_version"] = version.(int)
+		known := d.Get("request.0.headers").(map[string]interface{})
+		headers = make(map[string]string, len(known))
+		for k, v := range r.Headers {
+			if _, ok := known[k]; ok {
+				headers[k] = v
+			}
+		}
+	}
+	m["headers"] = mapStringStringToMapStringInterface(headers)
 
 	// We want to store the body as a string in the state file
 	// Try to parse body into JSON, fallback to a string if not
@@ -490,6 +585,13 @@ func webhookDelete(ctx context.Context, d *schema.ResourceData, meta interface{}
 func redactRequest(r broker.Request) broker.Request {
 	if r.Password != "" {
 		r.Password = "*****"
+	}
+	if len(r.Headers) > 0 {
+		headers := make(map[string]string, len(r.Headers))
+		for k := range r.Headers {
+			headers[k] = "*****"
+		}
+		r.Headers = headers
 	}
 	return r
 }

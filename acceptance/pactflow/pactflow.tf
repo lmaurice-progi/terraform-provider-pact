@@ -148,6 +148,29 @@ EOF
   depends_on = [pact_pacticipant.AdminUI, pact_pacticipant.GraphQLAPI]
 }
 
+resource "pact_webhook" "ui_changed_wo" {
+  description = "Trigger an API build when the UI changes (write-only credentials) ${var.build_number}"
+  team = pact_team.Simpsons.uuid
+  request {
+    url = "https://foo.com/some/endpoint"
+    method = "POST"
+    username_wo = "test"
+    username_wo_version = 1
+    password_wo = "password1"
+    password_wo_version = 1
+    headers = {
+      "X-Content-Type" = "application/json"
+    }
+    headers_wo = jsonencode({
+      "Authorization" = "Bearer token1"
+    })
+    headers_wo_version = 1
+    body = jsonencode({ pact = "$${pactbroker.pactUrl}" })
+  }
+
+  events = ["contract_published"]
+}
+
 ### Roles and Permissions
 
 resource "pact_role" "special_role" {

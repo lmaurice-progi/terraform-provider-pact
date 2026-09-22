@@ -51,6 +51,12 @@ func newFakeBroker(t *testing.T) (*fakeBroker, *httptest.Server) {
 			_, _ = w.Write([]byte(`{"description":"hook","_links":{"self":{"href":"http://broker/webhooks/webhook-id"}}}`))
 		case r.Method == http.MethodPut && r.URL.Path == "/webhooks/webhook-id":
 			_, _ = w.Write([]byte(`{"description":"hook","_links":{"self":{"href":"http://broker/webhooks/webhook-id"}}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/webhooks/webhook-id":
+			// the broker echoes every header, including the write-only ones
+			_, _ = w.Write([]byte(`{"description":"hook","enabled":true,"events":[{"name":"contract_published"}],` +
+				`"request":{"url":"https://example.com/hook","method":"POST","username":"wo-user","password":"*****",` +
+				`"headers":{"Content-Type":"application/json","Authorization":"Bearer t0k3n"},"body":{"pact":"url"}},` +
+				`"_links":{"self":{"href":"http://broker/webhooks/webhook-id"}}}`))
 		default:
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
@@ -384,4 +390,91 @@ func TestWebhook_PasswordConflictsWithPasswordWriteOnly(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.True(t, hasErrorDiag(resp.Diagnostics), "expected a validation error")
+}
+
+func TestWebhook_UsernameAndHeadersWriteOnly(t *testing.T) {
+	broker, brokerSrv := newFakeBroker(t)
+	srv, p := testProviderServer(t, brokerSrv.URL)
+	ty := p.ResourcesMap["pact_webhook"].CoreConfigSchema().ImpliedType()
+
+	doc := func(token string, version int) string {
+		return `{
+			"description": "hook",
+			"events": ["contract_published"],
+			"request": [{
+				"url": "https://example.com/hook",
+				"method": "POST",
+				"username_wo": "wo-user",
+				"username_wo_version": 1,
+				"headers": {"Content-Type": "application/json"},
+				"headers_wo": "{\"Authorization\": \"Bearer ` + token + `\"}",
+				"headers_wo_version": ` + strconv.Itoa(version) + `,
+				"body": "{\"pact\":\"url\"}"
+			}]
+		}`
+	}
+
+	state := planAndApply(t, srv, "pact_webhook", ty, cty.NullVal(ty), objectFromJSON(t, ty, doc("t0k3n", 1)))
+
+	request := broker.last("POST /webhooks")["request"].(map[string]interface{})
+	assert.Equal(t, "wo-user", request["username"])
+	assert.Equal(t, map[string]interface{}{"Content-Type": "application/json", "Authorization": "Bearer t0k3n"}, request["headers"])
+
+	req := state.GetAttr("request").Index(cty.NumberIntVal(0))
+	assert.Equal(t, cty.MapVal(map[string]cty.Value{"Content-Type": cty.StringVal("application/json")}), req.GetAttr("headers"))
+	assert.Equal(t, "1", req.GetAttr("username_wo_version").AsBigFloat().String())
+	assert.Equal(t, "1", req.GetAttr("headers_wo_version").AsBigFloat().String())
+	assert.NotContains(t, state.GoString(), "wo-user")
+	assert.NotContains(t, state.GoString(), "t0k3n")
+
+	// Refreshing must not pull the write-only values back from the broker into the state
+	read, err := srv.ReadResource(context.Background(), &tfprotov5.ReadResourceRequest{
+		TypeName:     "pact_webhook",
+		CurrentState: dynamicValue(t, ty, state),
+	})
+	require.NoError(t, err)
+	requireNoDiags(t, read.Diagnostics)
+	refreshed := decodeDynamicValue(t, ty, read.NewState)
+	assert.NotContains(t, refreshed.GoString(), "wo-user")
+	assert.NotContains(t, refreshed.GoString(), "t0k3n")
+	assert.Equal(t, req.GetAttr("headers"), refreshed.GetAttr("request").Index(cty.NumberIntVal(0)).GetAttr("headers"))
+
+	// Rotate the token
+	state = planAndApply(t, srv, "pact_webhook", ty, state, objectFromJSON(t, ty, doc("n3w-t0k3n", 2)))
+
+	request = broker.last("PUT /webhooks/webhook-id")["request"].(map[string]interface{})
+	assert.Equal(t, "Bearer n3w-t0k3n", request["headers"].(map[string]interface{})["Authorization"])
+	assert.NotContains(t, state.GoString(), "t0k3n")
+}
+
+func TestWebhook_WriteOnlyValidation(t *testing.T) {
+	_, brokerSrv := newFakeBroker(t)
+	srv, p := testProviderServer(t, brokerSrv.URL)
+	ty := p.ResourcesMap["pact_webhook"].CoreConfigSchema().ImpliedType()
+
+	doc := func(request string) string {
+		return `{"description": "hook", "events": ["contract_published"], "request": [{
+			"url": "https://example.com/hook", "method": "POST", "headers": {}, ` + request + `}]}`
+	}
+
+	cases := map[string]string{
+		"both username and username_wo":  `"username": "a", "username_wo": "b", "username_wo_version": 1`,
+		"username_wo without version":    `"username_wo": "b"`,
+		"headers_wo without version":     `"headers_wo": "{}"`,
+		"headers_wo_version alone":       `"headers_wo_version": 1`,
+		"headers_wo is not JSON":         `"headers_wo": "nope", "headers_wo_version": 1`,
+		"headers_wo is not a string map": `"headers_wo": "{\"a\": 1}", "headers_wo_version": 1`,
+	}
+
+	for name, request := range cases {
+		t.Run(name, func(t *testing.T) {
+			resp, err := srv.ValidateResourceTypeConfig(context.Background(), &tfprotov5.ValidateResourceTypeConfigRequest{
+				TypeName:           "pact_webhook",
+				Config:             dynamicValue(t, ty, objectFromJSON(t, ty, doc(request))),
+				ClientCapabilities: &tfprotov5.ValidateResourceTypeConfigClientCapabilities{WriteOnlyAttributesAllowed: true},
+			})
+			require.NoError(t, err)
+			assert.True(t, hasErrorDiag(resp.Diagnostics), "expected a validation error")
+		})
+	}
 }
