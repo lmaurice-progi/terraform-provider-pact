@@ -38,6 +38,14 @@ resource "pact_secret" "jenkins_token" {
   team = pact_team.Simpsons.uuid
 }
 
+resource "pact_secret" "jenkins_token_wo" {
+  name = "JenkinsTriggerTokenWO${var.build_number}"
+  description = "Write-only API token to trigger Jenkins builds"
+  value_wo = "super secret thing v1"
+  value_wo_version = 1
+  team = pact_team.Simpsons.uuid
+}
+
 ### Applications
 
 resource "pact_pacticipant" "example" {
