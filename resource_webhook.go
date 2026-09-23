@@ -10,7 +10,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/hashicorp/terraform-plugin-sdk/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/mitchellh/mapstructure"
 	"github.com/pactflow/terraform/broker"
 	"github.com/pactflow/terraform/client"
@@ -25,20 +25,16 @@ var allowedEvents = []string{
 	"contract_requiring_verification_published",
 }
 
+// NOTE: SDK v2 does not support TypeMap with a *schema.Resource Elem. The map
+// only ever carries a single "name" key, so model it as a map of strings.
 var pacticipantType = &schema.Schema{
-	Type:     schema.TypeMap,
-	Optional: true,
-	Computed: true,
-	ForceNew: true,
-	Elem: &schema.Resource{
-		Schema: map[string]*schema.Schema{
-			"name": {
-				Type:        schema.TypeString,
-				Required:    true,
-				ForceNew:    true,
-				Description: "A short description of the webhook",
-			},
-		},
+	Type:        schema.TypeMap,
+	Optional:    true,
+	Computed:    true,
+	ForceNew:    true,
+	Description: "The pacticipant this webhook applies to, e.g. { name = \"my-app\" }",
+	Elem: &schema.Schema{
+		Type: schema.TypeString,
 	},
 }
 

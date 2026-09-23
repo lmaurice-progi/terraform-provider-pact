@@ -6,16 +6,10 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/hashicorp/terraform-plugin-sdk/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/pactflow/terraform/broker"
 	"github.com/pactflow/terraform/client"
 )
-
-var secretType = &schema.Schema{
-	Type:     schema.TypeMap,
-	Optional: true,
-	Elem:     &schema.Resource{},
-}
 
 func secret() *schema.Resource {
 	return &schema.Resource{
